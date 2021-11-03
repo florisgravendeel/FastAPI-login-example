@@ -1,149 +1,95 @@
-from datetime import datetime, timedelta
-from typing import Optional
-
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
+from fastapi_jwt_auth import AuthJWT
+from fastapi_jwt_auth.exceptions import AuthJWTException
 from pydantic import BaseModel
 
-# to get a string like this run:
-# openssl rand -hex 32
-from starlette.middleware.cors import CORSMiddleware
+"""
+By default, the CRSF cookies will be called csrf_access_token and
+csrf_refresh_token, and in protected endpoints we will look
+for the CSRF token in the 'X-CSRF-Token' headers. only certain
+methods should define CSRF token in headers default is ('POST','PUT','PATCH','DELETE')
+"""
 
-SECRET_KEY = "967e64e52668340468d3075c80461de8b22f484487be1fe83c8bd77c2ca06e79"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-fake_users_db = {
-    "johndoe": {
-        "username": "johndoe",
-        "full_name": "John Doe",
-        "email": "johndoe@example.com",
-        "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",
-        "disabled": False,
-    },
-    "johndoe2": {
-        "username": "johndoe2",
-        "full_name": "Johnny Captian!",
-        "email": "johnny@yahoo.com",
-        "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",
-        "disabled": False,
-    }
-}
-
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
+app = FastAPI()
 
 
 class User(BaseModel):
     username: str
-    email: Optional[str] = None
-    full_name: Optional[str] = None
-    disabled: Optional[bool] = None
+    password: str
 
 
-class UserInDB(User):
-    hashed_password: str
+class Settings(BaseModel):
+    authjwt_secret_key: str = "secret"
+    # Configure application to store and get JWT from cookies
+    authjwt_token_location: set = {"cookies"}
+    # Only allow JWT cookies to be sent over https
+    authjwt_cookie_secure: bool = False
+    # Enable csrf double submit protection. default is True
+    authjwt_cookie_csrf_protect: bool = True
+    # Change to 'lax' in production to make your website more secure from CSRF Attacks, default is None
+    # authjwt_cookie_samesite: str = 'lax'
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@AuthJWT.load_config
+def get_config():
+    return Settings()
 
 
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
-
-
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
-    if not user:
-        return False
-    if not verify_password(password, user.hashed_password):
-        return False
-    return user
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+@app.exception_handler(AuthJWTException)
+def authjwt_exception_handler(request: Request, exc: AuthJWTException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message}
     )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError:
-        raise credentials_exception
-    user = get_user(fake_users_db, username=token_data.username)
-    if user is None:
-        raise credentials_exception
-    return user
 
 
-async def get_current_active_user(current_user: User = Depends(get_current_user)):
-    if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user
+@app.post('/login')
+def login(user: User, Authorize: AuthJWT = Depends()):
+    """
+    With authjwt_cookie_csrf_protect set to True, set_access_cookies() and
+    set_refresh_cookies() will now also set the non-httponly CSRF cookies
+    """
+    if user.username != "test" or user.password != "test":
+        raise HTTPException(status_code=401, detail="Bad username or password")
+
+    # Create the tokens and passing to set_access_cookies or set_refresh_cookies
+    access_token = Authorize.create_access_token(subject=user.username)
+    refresh_token = Authorize.create_refresh_token(subject=user.username)
+
+    # Set the JWT and CSRF double submit cookies in the response
+    Authorize.set_access_cookies(access_token)
+    Authorize.set_refresh_cookies(refresh_token)
+    return {"msg": "Successfully login"}
 
 
-@app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+@app.post('/refresh')
+def refresh(Authorize: AuthJWT = Depends()):
+    Authorize.jwt_refresh_token_required()
+
+    current_user = Authorize.get_jwt_subject()
+    new_access_token = Authorize.create_access_token(subject=current_user)
+    # Set the JWT and CSRF double submit cookies in the response
+    Authorize.set_access_cookies(new_access_token)
+    return {"msg": "The token has been refresh"}
 
 
-@app.get("/users/me/", response_model=User)
-async def read_users_me(current_user: User = Depends(get_current_active_user)):
-    return current_user
+@app.delete('/logout')
+def logout(Authorize: AuthJWT = Depends()):
+    """
+    Because the JWT are stored in an httponly cookie now, we cannot
+    log the user out by simply deleting the cookie in the frontend.
+    We need the backend to send us a response to delete the cookies.
+    """
+    Authorize.jwt_required()
+
+    Authorize.unset_jwt_cookies()
+    return {"msg": "Successfully logout"}
+
+
+@app.get('/protected')
+def protected(Authorize: AuthJWT = Depends()):
+    Authorize.jwt_required()
+
+    current_user = Authorize.get_jwt_subject()
+    return {"user": current_user}
